@@ -1,107 +1,128 @@
-#include "DHT.h"
 #include <WiFi.h>
-#include <AsyncMqttClient.h>
-#include <esp_sleep.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include "ACS712.h"
+const char* ssid = "SMART_HOME";
+const char* password = "SMART_HOME2025";
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
+WiFiClient espClient;
+PubSubClient client(espClient);
+#define LED_PIN  5      
+#define AC_PIN   18      
+#define FRIDGE_PIN 19    
+#define TV_PIN  21      
+#define PIR_PIN  23      
+#define DHT_PIN  15      
+#define DHT_TYPE DHT22   
+DHT dht(DHT_PIN, DHT_TYPE);
+#define ACS_PIN  34  
+ACS712 acs(ACS_PIN, 5.0, 1023, 100);
+const char* LED_ID = "device_001";
+const char* AC_ID = "device_002";
+const char* FRIDGE_ID = "device_003";
+const char* TV_ID = "device_004";
 
-#define WIFI_SSID "REPLACE_WITH_YOUR_SSID"
-#define WIFI_PASSWORD "REPLACE_WITH_YOUR_PASSWORD"
-#define MQTT_HOST IPAddress(192, 168, 1, 255)
-#define MQTT_PORT 1883
-
-// Device ID
-#define DHT_SENSOR_ID "DHT22_01"
-#define ACS712_SENSOR_ID "ACS712_01"
-#define PIR_SENSOR_ID "PIR_01"
-#define AC_DEVICE_ID "AC_01"
-#define LIGHT_DEVICE_ID "LIGHT_01"
-
-#define DHTPIN 4  
-#define DHTTYPE DHT22  
-#define ACS712_PIN 12   
-#define PIR_PIN 7       
-#define AC_PIN  8       
-#define LIGHT_PIN 9     
-#define NO_MOTION_TIMEOUT 600000 
-
-DHT dht(DHTPIN, DHTTYPE);
-AsyncMqttClient mqttClient;
-unsigned long previousMillis = 0;
-const long interval = 12 * 60 * 60 * 1000;
-bool motionDetected = false;
-unsigned long lastMotionTime = 0;
-float VOLTAGE = 220.0;
-
-void connectToWifi() {
-  Serial.println("Connecting to Wi-Fi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
-void connectToMqtt() {
-  Serial.println("Connecting to MQTT...");
-  mqttClient.connect();
-}
-
-void checkMotion() {
-  if (digitalRead(PIR_PIN) == HIGH) {
-    motionDetected = true;
-    lastMotionTime = millis();
-    digitalWrite(AC_PIN, HIGH);
-    digitalWrite(LIGHT_PIN, HIGH);
-    mqttClient.publish("esp32/ac_status", 1, true, AC_DEVICE_ID ":1");
-    mqttClient.publish("esp32/light_status", 1, true, LIGHT_DEVICE_ID ":1");
-  } else if (millis() - lastMotionTime > NO_MOTION_TIMEOUT) {
-    motionDetected = false;
-    digitalWrite(AC_PIN, LOW);
-    digitalWrite(LIGHT_PIN, LOW);
-    mqttClient.publish("esp32/ac_status", 1, true, AC_DEVICE_ID ":0");
-    mqttClient.publish("esp32/light_status", 1, true, LIGHT_DEVICE_ID ":0");
-  }
-}
-
-float readCurrent() {
-  int sensorValue = analogRead(ACS712_PIN);
-  float voltage = sensorValue * (5.0 / 4095.0);
-  float current = (voltage - 2.5) / 0.185;
-  return abs(current);
-}
-
-void deepSleepMode() {
-  Serial.println("Entering deep sleep mode...");
-  esp_sleep_enable_timer_wakeup(6 * 60 * 60 * 1000000);
-  esp_deep_sleep_start();
-}
+float lastTemperature = 0.0;
+float lastHumidity = 0.0;
+bool lastMotionState = false;
+unsigned long lastPowerReport = 0;
+const unsigned long powerReportInterval = 12 * 60 * 60 * 1000; // 12 ساعة بالمللي ثانية
 
 void setup() {
-  Serial.begin(115200);
-  dht.begin();
-  pinMode(PIR_PIN, INPUT);
-  pinMode(AC_PIN, OUTPUT);
-  pinMode(LIGHT_PIN, OUTPUT);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  connectToWifi();
-  connectToMqtt();
+    Serial.begin(115200);
+    
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(AC_PIN, OUTPUT);
+    pinMode(FRIDGE_PIN, OUTPUT);
+    pinMode(TV_PIN, OUTPUT);
+    pinMode(PIR_PIN, INPUT);
+    
+    dht.begin();
+    
+    setup_wifi();
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(callback);
+}
+
+void setup_wifi() {
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+    }
+    Serial.println("WiFi connected!");
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    
+    if (String(topic) == "home/led") {
+        controlDevice(LED_PIN, message.toInt(), "LED", LED_ID);
+    }
+    else if (String(topic) == "home/ac") {
+        controlDevice(AC_PIN, message.toInt(), "AC", AC_ID);
+    }
+    else if (String(topic) == "home/fridge") {
+        controlDevice(FRIDGE_PIN, message.toInt(), "Fridge", FRIDGE_ID);
+    }
+    else if (String(topic) == "home/tv") {
+        controlDevice(TV_PIN, message.toInt(), "TV", TV_ID);
+    }
+}
+
+void controlDevice(int pin, int state, String deviceName, const char* deviceId) {
+    digitalWrite(pin, state);
+    String statusMsg = String("{") + "\"id\":\"" + deviceId + "\",\"state\":\"" + (state ? "ON" : "OFF") + "\"}";
+    client.publish("home/status", statusMsg.c_str());
+}
+
+void reconnect() {
+    while (!client.connected()) {
+        if (client.connect("ESP32Client")) {
+            client.subscribe("home/led");
+            client.subscribe("home/ac");
+            client.subscribe("home/fridge");
+            client.subscribe("home/tv");
+        } else {
+            delay(5000);
+        }
+    }
 }
 
 void loop() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;
+    if (!client.connected()) {
+        reconnect();
+    }
+    client.loop();
 
-  if (timeinfo.tm_hour >= 0 && timeinfo.tm_hour < 6) {
-    deepSleepMode();
-  }
+    readSensors();
+}
 
-  checkMotion();
+void readSensors() {
+    bool motionState = digitalRead(PIR_PIN);
+    if (motionState != lastMotionState) {
+        lastMotionState = motionState;
+        String motionMsg = motionState ? "{\"motion\":\"detected\"}" : "{\"motion\":\"none\"}";
+        client.publish("home/motion", motionMsg.c_str());
+    }
 
-  if (millis() - previousMillis >= interval) {
-    previousMillis = millis();
-    float temp = dht.readTemperature();
-    float hum = dht.readHumidity();
-    float current = readCurrent();
-    float power = current * VOLTAGE;
-    
-    mqttClient.publish("esp32/dht/temperature", 1, true, DHT_SENSOR_ID ":" + String(temp).c_str());
-    mqttClient.publish("esp32/dht/humidity", 1, true, DHT_SENSOR_ID ":" + String(hum).c_str());
-    mqttClient.publish("esp32/acs712/current", 1, true, ACS712_SENSOR_ID ":" + String(current).c_str());
-    mqttClient.publish("esp32/acs712/power", 1, true, ACS712_SENSOR_ID ":" + String(power).c_str());
-  }
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    if (abs(temperature - lastTemperature) > 0.5 || abs(humidity - lastHumidity) > 2.0) {
+        lastTemperature = temperature;
+        lastHumidity = humidity;
+        String tempMsg = "{\"temperature\":\"" + String(temperature) + "\"}";
+        String humMsg = "{\"humidity\":\"" + String(humidity) + "\"}";
+        client.publish("home/temperature", tempMsg.c_str());
+        client.publish("home/humidity", humMsg.c_str());
+    }
+
+    if (millis() - lastPowerReport >= powerReportInterval) {
+        lastPowerReport = millis();
+        float current = acs.mA_AC();  
+        String energyMsg = "{\"power_consumption\":\"" + String(current) + " mA\"}";
+        client.publish("home/power", energyMsg.c_str());
+    }
 }
