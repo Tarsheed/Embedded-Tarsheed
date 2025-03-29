@@ -1,66 +1,125 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <DHT.h>
+#include <ArduinoJson.h>
 #include "ACS712.h"
+#include <SPIFFS.h>
+#include <HTTPClient.h>
 
-// بيانات شبكة WiFi
+// بيانات WiFi
 const char* ssid = "TARSHEED";
 const char* password = "TARSHEED2025";
-const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
+
+// بيانات MQTT
+const char* mqtt_server = "seal-01.lmq.cloudamqp.com";
+const int mqtt_port = 1883;
+const char* mqtt_user = "frtmkjcl";
+const char* mqtt_password = "YOUR_MQTT_PASSWORD";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+HTTPClient http;
 
-// تعريف البنات للأجهزة المختلفة
-#define LED_PIN 5
-#define AC_PIN 18
-#define FRIDGE_PIN 19
-#define TV_PIN 21
-#define PIR_PIN 23
+// تعريف الحساسات
 #define DHT_PIN 15
 #define DHT_TYPE DHT22
 #define ACS_PIN 34
-
 DHT dht(DHT_PIN, DHT_TYPE);
 ACS712 acs(ACS_PIN, 5.0, 1023, 100);
 
-// معرفات الأجهزة
-const char* LED_ID = "device_led";
-const char* AC_ID = "device_ac";
-const char* FRIDGE_ID = "device_fridge";
-const char* TV_ID = "device_tv";
-
-float lastTemperature = 0.0;
-float lastHumidity = 0.0;
-bool lastMotionState = false;
-unsigned long lastEnergyReport = 0;
+// متغيرات البيانات
+String userID = "";
+StaticJsonDocument<2048> configData;
+float lastTemperature = 0.0, lastHumidity = 0.0;
+unsigned long lastEnergyReport = 0, lastReconnectAttempt = 0;
 const unsigned long reportInterval = 12 * 60 * 60 * 1000;
 
 void setup() {
     Serial.begin(115200);
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(AC_PIN, OUTPUT);
-    pinMode(FRIDGE_PIN, OUTPUT);
-    pinMode(TV_PIN, OUTPUT);
-    pinMode(PIR_PIN, INPUT);
-    digitalWrite(LED_PIN, LOW);
-    digitalWrite(AC_PIN, LOW);
-    digitalWrite(FRIDGE_PIN, LOW);
-    digitalWrite(TV_PIN, LOW);
-    dht.begin();
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("Failed to mount SPIFFS");
+        return;
+    }
+
     setup_wifi();
-    client.setServer(mqtt_server, 1883);
+    client.setServer(mqtt_server, mqtt_port);
     client.setCallback(callback);
+
+    loadConfig();
+    fetchDevicesFromBackend();
+
+    reconnect();
 }
 
 void setup_wifi() {
-    Serial.println("Connecting to WiFi...");
+    Serial.print("Connecting to WiFi...");
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("\nWiFi connected!");
+    Serial.println("Connected to WiFi");
+}
+
+void loadConfig() {
+    File file = SPIFFS.open("/config.json", "r");
+    if (!file) {
+        Serial.println("Config file not found, creating new one...");
+        saveConfig();
+        return;
+    }
+    DeserializationError error = deserializeJson(configData, file);
+    if (error) Serial.println("Failed to parse config file");
+    file.close();
+}
+
+void saveConfig() {
+    File file = SPIFFS.open("/config.json", "w");
+    if (!file) {
+        Serial.println("Failed to save config file");
+        return;
+    }
+    serializeJson(configData, file);
+    file.close();
+}
+
+void fetchDevicesFromBackend() {
+    Serial.println("Fetching devices from backend...");
+    http.begin("http://your-backend.com/devices");
+    int httpCode = http.GET();
+    
+    if (httpCode == 200) {
+        String payload = http.getString();
+        DeserializationError error = deserializeJson(configData, payload);
+        if (!error) {
+            saveConfig();
+            Serial.println("Devices updated from backend");
+        } else {
+            Serial.println("Failed to parse backend response");
+        }
+    } else {
+        Serial.println("Failed to fetch devices, HTTP Code: " + String(httpCode));
+    }
+    
+    http.end();
+}
+
+void reconnect() {
+    if (millis() - lastReconnectAttempt < 5000) return;
+    lastReconnectAttempt = millis();
+
+    while (!client.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        if (client.connect("ESP32Client", mqtt_user, mqtt_password)) {
+            Serial.println("Connected to MQTT Broker");
+            client.subscribe("home/devices");
+            client.publish("home/test", "ESP32 connected to CloudAMQP");
+        } else {
+            Serial.println("Failed, rc=" + String(client.state()));
+            delay(5000);
+        }
+    }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -68,77 +127,51 @@ void callback(char* topic, byte* payload, unsigned int length) {
     for (unsigned int i = 0; i < length; i++) {
         message += (char)payload[i];
     }
-    Serial.print("Received message: ");
-    Serial.println(message);
+    Serial.println("Received message: " + message);
 
-    if (String(topic) == "home/led") {
-        controlDevice(LED_PIN, message.toInt(), LED_ID);
-    } else if (String(topic) == "home/ac") {
-        controlDevice(AC_PIN, message.toInt(), AC_ID);
-    } else if (String(topic) == "home/fridge") {
-        controlDevice(FRIDGE_PIN, message.toInt(), FRIDGE_ID);
-    } else if (String(topic) == "home/tv") {
-        controlDevice(TV_PIN, message.toInt(), TV_ID);
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, message);
+    if (error) {
+        Serial.println("Invalid JSON format");
+        return;
     }
-}
 
-void controlDevice(int pin, int state, const char* deviceId) {
-    digitalWrite(pin, state);
-    Serial.printf("%s state changed to: %s\n", deviceId, state ? "ON" : "OFF");
-}
+    int pinNumber = doc["pin"];
+    String command = doc["command"];
 
-void reconnect() {
-    while (!client.connected()) {
-        Serial.print("Attempting MQTT connection...");
-        if (client.connect("ESP32Client")) {
-            Serial.println("connected");
-            client.subscribe("home/led");
-            client.subscribe("home/ac");
-            client.subscribe("home/fridge");
-            client.subscribe("home/tv");
-        } else {
-            Serial.print("failed, rc=");
-            Serial.println(client.state());
-            delay(5000);
-        }
+    if (command == "ON") {
+        digitalWrite(pinNumber, HIGH);
+        Serial.println("Turned ON device at pin: " + String(pinNumber));
+    } else if (command == "OFF") {
+        digitalWrite(pinNumber, LOW);
+        Serial.println("Turned OFF device at pin: " + String(pinNumber));
     }
-}
-
-void loop() {
-    if (!client.connected()) {
-        reconnect();
-    }
-    client.loop();
-    readSensors();
 }
 
 void readSensors() {
-    bool motionState = digitalRead(PIR_PIN);
-    if (motionState != lastMotionState) {
-        lastMotionState = motionState;
-        String motionMsg = motionState ? "تم اكتشاف حركة!" : "لا يوجد حركة.";
-        client.publish("home/motion", motionMsg.c_str());
-        Serial.println(motionMsg);
-    }
-
     float temperature = dht.readTemperature();
     float humidity = dht.readHumidity();
-    if (abs(temperature - lastTemperature) > 0.5 || abs(humidity - lastHumidity) > 2.0) {
-        lastTemperature = temperature;
-        lastHumidity = humidity;
-        String tempMsg = "درجة الحرارة: " + String(temperature) + "°C";
-        String humMsg = "الرطوبة: " + String(humidity) + "%";
-        client.publish("home/temperature", tempMsg.c_str());
-        client.publish("home/humidity", humMsg.c_str());
-        Serial.println(tempMsg);
-        Serial.println(humMsg);
+
+    if (!isnan(temperature) && !isnan(humidity)) {
+        if (abs(temperature - lastTemperature) > 0.5 || abs(humidity - lastHumidity) > 2.0) {
+            lastTemperature = temperature;
+            lastHumidity = humidity;
+            client.publish("home/temperature", String(temperature).c_str());
+            client.publish("home/humidity", String(humidity).c_str());
+        }
+    } else {
+        Serial.println("Failed to read from DHT sensor");
     }
 
     if (millis() - lastEnergyReport >= reportInterval) {
         lastEnergyReport = millis();
-        float current = acs.mA_AC();  
-        String energyMsg = "استهلاك الكهرباء الحالي: " + String(current) + " mA";
-        client.publish("home/power", energyMsg.c_str());
-        Serial.println(energyMsg);
+        float current = acs.mA_AC();
+        client.publish("home/power", String(current).c_str());
     }
+}
+
+void loop() {
+    if (!client.connected()) reconnect();
+    client.loop();
+    readSensors();
 }
